@@ -4,22 +4,73 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
+	"sync"
 )
 
-var nodes = []string{
-	"http://localhost:8081",
-	"http://localhost:8082",
-	"http://localhost:8083",
+type ConsistentHash struct {
+	sortedHashes []uint32
+	circle       map[uint32]string
+	mu           sync.RWMutex
 }
+
+func NewConsistentHash() *ConsistentHash {
+	return &ConsistentHash{
+		circle: make(map[uint32]string),
+	}
+}
+
+func (ch *ConsistentHash) AddNode(node string) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
+	hash := crc32.ChecksumIEEE([]byte(node))
+	ch.circle[hash] = node
+	ch.sortedHashes = append(ch.sortedHashes, hash)
+	sort.Slice(ch.sortedHashes, func(i, j int) bool {
+		return ch.sortedHashes[i] < ch.sortedHashes[j]
+	})
+	slog.Info("Node added to ring", "node", node, "hash", hash)
+}
+
+func (ch *ConsistentHash) GetNode(key string) string {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
+	if len(ch.circle) == 0 {
+		return ""
+	}
+
+	hash := crc32.ChecksumIEEE([]byte(key))
+	idx := sort.Search(len(ch.sortedHashes), func(i int) bool {
+		return ch.sortedHashes[i] >= hash
+	})
+
+	// Wrap around
+	if idx == len(ch.sortedHashes) {
+		idx = 0
+	}
+
+	return ch.circle[ch.sortedHashes[idx]]
+}
+
+var (
+	ring *ConsistentHash
+)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+
+	ring = NewConsistentHash()
+	ring.AddNode("http://localhost:8081")
+	ring.AddNode("http://localhost:8082")
+	ring.AddNode("http://localhost:8083")
 
 	http.HandleFunc("/set", handleSet)
 	http.HandleFunc("/get", handleGet)
@@ -29,13 +80,6 @@ func main() {
 		slog.Error("Proxy failed", "error", err)
 		os.Exit(1)
 	}
-}
-
-func getNode(key string) string {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	idx := h.Sum32() % uint32(len(nodes))
-	return nodes[idx]
 }
 
 type SetRequest struct {
@@ -49,7 +93,6 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read body to get key
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
@@ -63,7 +106,11 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	node := getNode(req.Key)
+	node := ring.GetNode(req.Key)
+	if node == "" {
+		http.Error(w, "No nodes available", http.StatusServiceUnavailable)
+		return
+	}
 	slog.Info("Forwarding SET", "key", req.Key, "node", node)
 
 	proxyReq, err := http.NewRequest(http.MethodPost, node+"/set", bytes.NewBuffer(body))
@@ -96,7 +143,11 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	node := getNode(key)
+	node := ring.GetNode(key)
+	if node == "" {
+		http.Error(w, "No nodes available", http.StatusServiceUnavailable)
+		return
+	}
 	slog.Info("Forwarding GET", "key", key, "node", node)
 
 	proxyReq, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/get?key=%s", node, key), nil)
