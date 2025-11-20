@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -79,9 +80,18 @@ func main() {
 	slog.SetDefault(logger)
 
 	ring = NewConsistentHash()
-	ring.AddNode("http://localhost:8081")
-	ring.AddNode("http://localhost:8082")
-	ring.AddNode("http://localhost:8083")
+
+	// Check if "NODES" env var is set (format: "node1:8080,node2:8080")
+	nodeList := os.Getenv("NODES")
+	if nodeList == "" {
+		// Default for local testing
+		nodeList = "http://localhost:8081,http://localhost:8082,http://localhost:8083"
+	}
+
+	nodes := strings.Split(nodeList, ",")
+	for _, node := range nodes {
+		ring.AddNode(node)
+	}
 
 	http.HandleFunc("/set", handleSet)
 	http.HandleFunc("/get", handleGet)

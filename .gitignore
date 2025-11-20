@@ -22,3 +22,9 @@ go.work
 
 # User-specific
 bin/
+
+# Logs
+*.log
+
+# Docker Data
+data/
