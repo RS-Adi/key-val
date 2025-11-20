@@ -5,7 +5,7 @@ import (
 )
 
 func TestInMemoryStore(t *testing.T) {
-	s := NewInMemoryStore()
+	s := NewInMemoryStore(nil)
 
 	// Test Set and Get
 	key := "foo"

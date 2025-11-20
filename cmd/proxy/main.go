@@ -38,12 +38,12 @@ func (ch *ConsistentHash) AddNode(node string) {
 	slog.Info("Node added to ring", "node", node, "hash", hash)
 }
 
-func (ch *ConsistentHash) GetNode(key string) string {
+func (ch *ConsistentHash) GetNodes(key string, count int) []string {
 	ch.mu.RLock()
 	defer ch.mu.RUnlock()
 
 	if len(ch.circle) == 0 {
-		return ""
+		return nil
 	}
 
 	hash := crc32.ChecksumIEEE([]byte(key))
@@ -51,12 +51,23 @@ func (ch *ConsistentHash) GetNode(key string) string {
 		return ch.sortedHashes[i] >= hash
 	})
 
-	// Wrap around
 	if idx == len(ch.sortedHashes) {
 		idx = 0
 	}
 
-	return ch.circle[ch.sortedHashes[idx]]
+	nodes := make([]string, 0, count)
+	seen := make(map[string]bool)
+
+	for len(nodes) < count && len(nodes) < len(ch.circle) {
+		node := ch.circle[ch.sortedHashes[idx]]
+		if !seen[node] {
+			nodes = append(nodes, node)
+			seen[node] = true
+		}
+		idx = (idx + 1) % len(ch.sortedHashes)
+	}
+
+	return nodes
 }
 
 var (
@@ -106,29 +117,51 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	node := ring.GetNode(req.Key)
-	if node == "" {
+	nodes := ring.GetNodes(req.Key, 3)
+	if len(nodes) == 0 {
 		http.Error(w, "No nodes available", http.StatusServiceUnavailable)
 		return
 	}
-	slog.Info("Forwarding SET", "key", req.Key, "node", node)
+	slog.Info("Replicating SET", "key", req.Key, "nodes", nodes)
 
-	proxyReq, err := http.NewRequest(http.MethodPost, node+"/set", bytes.NewBuffer(body))
-	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
-		return
+	var wg sync.WaitGroup
+	successCount := 0
+	var mu sync.Mutex
+
+	for _, node := range nodes {
+		wg.Add(1)
+		go func(nodeAddr string) {
+			defer wg.Done()
+			proxyReq, err := http.NewRequest(http.MethodPost, nodeAddr+"/set", bytes.NewBuffer(body))
+			if err != nil {
+				slog.Error("Failed to create request", "node", nodeAddr, "error", err)
+				return
+			}
+			proxyReq.Header.Set("Content-Type", "application/json")
+
+			resp, err := http.DefaultClient.Do(proxyReq)
+			if err != nil {
+				slog.Error("Failed to forward request", "node", nodeAddr, "error", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(node)
 	}
-	proxyReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(proxyReq)
-	if err != nil {
-		http.Error(w, "Failed to forward request", http.StatusBadGateway)
-		return
+	wg.Wait()
+
+	if successCount >= 2 { // Quorum W=2
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	} else {
+		http.Error(w, "Failed to achieve write quorum", http.StatusBadGateway)
 	}
-	defer resp.Body.Close()
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
@@ -143,26 +176,33 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	node := ring.GetNode(key)
-	if node == "" {
+	nodes := ring.GetNodes(key, 3)
+	if len(nodes) == 0 {
 		http.Error(w, "No nodes available", http.StatusServiceUnavailable)
 		return
 	}
-	slog.Info("Forwarding GET", "key", key, "node", node)
+	slog.Info("Reading GET", "key", key, "nodes", nodes)
 
-	proxyReq, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/get?key=%s", node, key), nil)
-	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
-		return
+	for _, node := range nodes {
+		proxyReq, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/get?key=%s", node, key), nil)
+		if err != nil {
+			slog.Error("Failed to create request", "node", node, "error", err)
+			continue
+		}
+
+		resp, err := http.DefaultClient.Do(proxyReq)
+		if err != nil {
+			slog.Error("Failed to forward request", "node", node, "error", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			w.WriteHeader(http.StatusOK)
+			io.Copy(w, resp.Body)
+			return
+		}
 	}
 
-	resp, err := http.DefaultClient.Do(proxyReq)
-	if err != nil {
-		http.Error(w, "Failed to forward request", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	http.Error(w, "Key not found or all nodes failed", http.StatusNotFound)
 }

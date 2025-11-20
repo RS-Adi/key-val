@@ -1,6 +1,7 @@
 package store
 
 import (
+	"distributed-kv/internal/storage"
 	"sync"
 )
 
@@ -8,19 +9,48 @@ import (
 type InMemoryStore struct {
 	mu   sync.RWMutex
 	data map[string]string
+	wal  *storage.WAL
 }
 
 // NewInMemoryStore creates a new instance of InMemoryStore.
-func NewInMemoryStore() *InMemoryStore {
+func NewInMemoryStore(wal *storage.WAL) *InMemoryStore {
 	return &InMemoryStore{
 		data: make(map[string]string),
+		wal:  wal,
 	}
+}
+
+// Recover restores the store state from the WAL.
+func (s *InMemoryStore) Recover() error {
+	if s.wal == nil {
+		return nil
+	}
+
+	entries, err := s.wal.ReadAll()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, entry := range entries {
+		s.data[entry.Key] = entry.Value
+	}
+	return nil
 }
 
 // Set stores a value for a given key.
 func (s *InMemoryStore) Set(key string, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Write to WAL first
+	if s.wal != nil {
+		if err := s.wal.Write(key, value); err != nil {
+			return err
+		}
+	}
+
 	s.data[key] = value
 	return nil
 }
